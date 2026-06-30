@@ -1,0 +1,4 @@
+.DS_Store
+build/
+data/*.aof
+benchmarks/__pycache__/

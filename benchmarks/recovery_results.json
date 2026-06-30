@@ -1,0 +1,9 @@
+{
+  "keys_inserted": 100000,
+  "sampled_keys_checked": 1000,
+  "sampled_keys_recovered": 1000,
+  "recovery_seconds": 0.10700879199430346,
+  "insert_qps": 157024.94261183182,
+  "aof_path": "data/recovery_benchmark.aof",
+  "timestamp_unix": 1782829996.630445
+}

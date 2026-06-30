@@ -1,0 +1,19 @@
+{
+  "host": "127.0.0.1",
+  "port": 6381,
+  "clients": 100,
+  "requests": 100000,
+  "command": "mixed",
+  "pipelined": true,
+  "pipeline_depth": 32,
+  "total_time_seconds": 0.1640442080097273,
+  "qps": 609591.7753711262,
+  "avg_latency_ms": 0.08019105876330286,
+  "p50_latency_ms": 0.011484375136205927,
+  "p95_latency_ms": 0.029467468266375363,
+  "p99_latency_ms": 2.899235685617896,
+  "success_rate": 100.0,
+  "successes": 100000,
+  "failures": 0,
+  "timestamp_unix": 1782829960.621602
+}
