@@ -52,5 +52,23 @@ int main() {
         ASSERT_FALSE(parser.parse("MSET a 1 b").ok);
     });
 
+    failures += test::run("quoted values preserve whitespace and escapes", [&] {
+        const auto parsed = parser.parse(R"(SET message "hello \"systems\" world")");
+        ASSERT_TRUE(parsed.ok);
+        ASSERT_EQ(std::string("hello \"systems\" world"), parsed.command.args[1]);
+        ASSERT_EQ(std::string(""), parser.parse(R"(SET empty "")").command.args[1]);
+    });
+
+    failures += test::run("unterminated quotes are rejected", [&] {
+        const auto parsed = parser.parse(R"(SET message "not finished)");
+        ASSERT_FALSE(parsed.ok);
+        ASSERT_EQ(std::string("unterminated quoted string"), parsed.error);
+    });
+
+    failures += test::run("SAVE accepts no arguments", [&] {
+        ASSERT_TRUE(parser.parse("SAVE").ok);
+        ASSERT_FALSE(parser.parse("SAVE now").ok);
+    });
+
     return failures == 0 ? 0 : 1;
 }

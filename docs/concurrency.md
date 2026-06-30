@@ -1,44 +1,41 @@
-# Concurrency
+# Concurrency Model
 
-ByteCacheDB uses a bounded worker thread pool. The server accept loop does not process commands itself; it accepts sockets and hands each connection to the queue.
+## Socket And Worker Ownership
 
-## Why a Thread Pool
+- The acceptor only accepts and registers sockets.
+- One reader thread per connection performs blocking reads and ordered writes.
+- A bounded `ThreadPool` executes commands; idle clients do not consume these workers.
+- Shutdown interrupts active sockets before joining reader threads, so idle connections
+  cannot prevent termination.
 
-A thread pool keeps concurrency explicit and configurable through `--threads`. It avoids unbounded thread creation under many clients while still allowing multiple clients to make progress at the same time.
+## Shard Locking
 
-## Task Queue
+The default 64 storage shards independently protect their maps. Single-key commands touch
+one lock, allowing unrelated keys to progress concurrently. Multi-shard operations acquire
+locks in ascending shard index to avoid lock-order cycles.
 
-`ThreadPool` uses:
+Reads such as `GET` take a unique shard lock because they update approximate-LRU access
+time and may lazily delete an expired key. Snapshot and memory-estimation scans use shared
+locks.
 
-- `std::mutex`
-- `std::condition_variable`
-- `std::queue<std::function<void()>>`
-- `std::thread`
+## Ordered AOF Writes
 
-Workers sleep when the queue is empty and wake when new client sockets are enqueued.
+An AOF file mutex alone prevents byte interleaving but does not preserve mutation order.
+ByteCacheDB therefore uses a higher-level write-path mutex:
 
-## Storage Synchronization
+1. Acquire the write-path mutex.
+2. Execute the storage mutation.
+3. Assign an AOF sequence and append the record.
+4. Apply the configured fsync policy.
+5. Release the mutex and return the response.
 
-`StorageEngine` protects the map with `std::shared_mutex`.
+The gate is only required when AOF is enabled. With AOF disabled, independent shard writes
+can execute concurrently.
 
-Current operations often take a unique lock because reads may update `last_accessed` and may lazily remove expired keys. The shared mutex still leaves room for future read-only fast paths and keeps synchronization explicit at the storage boundary.
+## Atomicity Boundaries
 
-## Race Conditions Avoided
-
-- A key cannot be erased while another storage method is reading it because map access is lock-protected.
-- TTL cleanup and client command execution use the same storage lock.
-- AOF writes are protected by an internal mutex so commands from different clients do not interleave in the log.
-- Metrics use atomics for counters updated by multiple threads.
-
-## Known Bottlenecks
-
-- One global storage lock limits write-heavy scaling.
-- Blocking sockets tie one worker to one connected client.
-- AOF flushes every mutating command, which improves durability but can reduce throughput.
-
-## Future Improvements
-
-- Shard the keyspace by hash to reduce lock contention.
-- Use `epoll` or `kqueue` for many mostly idle connections.
-- Add AOF batching or configurable fsync policy.
-- Maintain a separate expiration heap or timing wheel for faster TTL cleanup.
+- Single-key methods are atomic at their shard.
+- `MSET` is atomic across its affected shards.
+- `MGET` reads keys sequentially and is not a transactionally consistent snapshot.
+- `KEYS` and snapshots obtain a cross-shard view.
+- There are no multi-command transactions or compare-and-swap operations.

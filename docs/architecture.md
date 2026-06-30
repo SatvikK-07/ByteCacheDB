@@ -1,75 +1,52 @@
 # Architecture
 
-ByteCacheDB is organized around small components with clear ownership.
+## Request Path
 
-## Server Accept Loop
+The acceptor owns the listening socket. Each accepted connection gets a lightweight
+reader thread that buffers newline-delimited requests. Parsed work is submitted to a
+fixed-size command pool, and the reader waits for each result before advancing, preserving
+connection order.
 
-`Server` owns the listening socket, storage engine, metrics, persistence layer, TTL manager, and thread pool. The main thread accepts TCP connections and submits accepted client sockets to `ThreadPool`.
-
-The accept loop is intentionally small:
-
-1. Create and bind the listening socket.
-2. Replay AOF if enabled.
-3. Start the TTL cleanup thread.
-4. Accept client sockets.
-5. Enqueue each socket for worker processing.
-
-## Client Lifecycle
-
-`ClientHandler` owns the request loop for one connected client. It reads from a blocking socket, buffers data, splits complete lines, parses commands, executes them, and writes responses back in order.
-
-The handler enforces a maximum line length to avoid unbounded memory growth from malformed clients.
-
-## Command Parsing
-
-`CommandParser` converts a raw line into:
-
-```cpp
-struct Command {
-    CommandType type;
-    std::vector<std::string> args;
-    std::string raw;
-};
+```mermaid
+flowchart LR
+    C[Client] --> A[TCP Acceptor]
+    A --> R[Connection Reader]
+    R --> Q[Worker Queue]
+    Q --> E[Command Executor]
+    E --> S[Storage Shards]
+    E --> W[Ordered Write Gate]
+    W --> L[AOF]
+    L --> D[Disk]
+    T[TTL Sweeper] --> S
 ```
 
-It uppercases command names, tolerates extra spaces, rejects empty input, validates argument counts, and returns parse errors instead of throwing.
+This separates idle socket waiting from command workers. The remaining one-reader-thread
+per connection model is deliberate and portable; `epoll`/`kqueue` would be the next
+networking scalability step.
 
-## Storage Engine
+## Storage
 
-`StorageEngine` owns the in-memory map:
+Keys are assigned by `hash(key) % shard_count`. Each shard owns an
+`unordered_map<string, ValueEntry>` and `shared_mutex`. Single-key operations lock one
+shard. `MSET`, snapshots, `KEYS`, and `FLUSH` lock their required shards in index order.
 
-```cpp
-std::unordered_map<std::string, ValueEntry>
-```
+Global atomics track live keys and evictions. When `--max-keys` is exceeded, an eviction
+coordinator samples the oldest timestamp visible across shards and removes a victim.
 
-Each entry contains:
+## Durability
 
-- value string
-- optional expiration timestamp
-- creation timestamp
-- last accessed timestamp
+With AOF enabled, a server-wide mutex spans command mutation and AOF append. AOF records
+receive monotonic sequence numbers under the file mutex. This produces one replay order
+that matches the actual write order across all command workers.
 
-Expired keys are removed lazily when accessed and by the background TTL manager.
+`SAVE` captures the live keyspace and current sequence, writes a temporary file, syncs it,
+and atomically renames it. Recovery loads that checkpoint and skips AOF records at or
+before the checkpoint sequence. Evictions are appended as explicit `DEL` records, while
+implicit max-key eviction is disabled during replay.
 
-## TTL Management
+## Lifecycle
 
-`TtlManager` wakes once per second and calls `StorageEngine::cleanup_expired()`. It updates metrics with the number of removed keys.
-
-This is simple and predictable. For very large keyspaces, a future improvement would sample keys or maintain an expiration index.
-
-## AOF Persistence
-
-`AppendOnlyFile` appends successful mutating commands when AOF is enabled. Startup replay rebuilds the in-memory state.
-
-`EXPIRE` is logged as `EXPIREAT key epoch_millis` to avoid extending TTL after restart.
-
-## Metrics
-
-`Metrics` stores atomic counters for:
-
-- connected clients
-- total commands processed
-- expired keys removed
-- server uptime
-
-`INFO` combines those counters with live storage metrics.
+`SIGINT` and `SIGTERM` are blocked in all workers and consumed by a dedicated `sigwait`
+thread. Shutdown closes the listener, calls `shutdown` on active clients, stops TTL
+cleanup, joins connection readers, drains/stops command workers, syncs AOF state, and
+closes files.

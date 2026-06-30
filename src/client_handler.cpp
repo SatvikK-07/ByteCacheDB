@@ -4,6 +4,8 @@
 #include <charconv>
 #include <chrono>
 #include <cstring>
+#include <future>
+#include <memory>
 #include <optional>
 #include <string_view>
 #include <sys/socket.h>
@@ -43,6 +45,8 @@ ClientHandler::ClientHandler(StorageEngine& storage,
                              CommandParser& parser,
                              AppendOnlyFile& persistence,
                              Metrics& metrics,
+                             ThreadPool& command_pool,
+                             std::mutex& write_path_mutex,
                              size_t worker_threads,
                              bool aof_enabled,
                              size_t max_line_bytes)
@@ -50,6 +54,8 @@ ClientHandler::ClientHandler(StorageEngine& storage,
       parser_(parser),
       persistence_(persistence),
       metrics_(metrics),
+      command_pool_(command_pool),
+      write_path_mutex_(write_path_mutex),
       worker_threads_(worker_threads),
       aof_enabled_(aof_enabled),
       max_line_bytes_(max_line_bytes) {}
@@ -98,7 +104,17 @@ void ClientHandler::handle(int client_fd) {
                 continue;
             }
 
-            auto result = persist_if_needed(execute(parsed.command));
+            auto promise = std::make_shared<std::promise<ExecutionResult>>();
+            auto future = promise->get_future();
+            const bool queued = command_pool_.enqueue(
+                [this, command = std::move(parsed.command), promise] {
+                    promise->set_value(execute_ordered(command));
+                });
+            if (!queued) {
+                send_all(client_fd, response::error("server is shutting down"));
+                return;
+            }
+            auto result = future.get();
             if (!send_all(client_fd, result.response)) {
                 return;
             }
@@ -197,7 +213,11 @@ ClientHandler::ExecutionResult ClientHandler::execute(const Command& command) {
                 response::bulk_string(metrics_.info(storage_.size(),
                                                     storage_.memory_estimate_bytes(),
                                                     worker_threads_,
-                                                    aof_enabled_));
+                                                    aof_enabled_,
+                                                    storage_.expired_keys_removed(),
+                                                    storage_.evicted_keys(),
+                                                    storage_.shard_count(),
+                                                    persistence_.fsync_policy_name()));
             return result;
 
         case CommandType::MSET:
@@ -240,6 +260,16 @@ ClientHandler::ExecutionResult ClientHandler::execute(const Command& command) {
             return result;
         }
 
+        case CommandType::SAVE: {
+            std::string error;
+            if (!persistence_.save_snapshot(storage_, error)) {
+                result.response = response::error("snapshot failure: " + error);
+                return result;
+            }
+            result.response = response::simple_string("OK");
+            return result;
+        }
+
         case CommandType::UNKNOWN:
             result.response = response::error("unknown command");
             return result;
@@ -247,6 +277,15 @@ ClientHandler::ExecutionResult ClientHandler::execute(const Command& command) {
 
     result.response = response::error("unknown command");
     return result;
+}
+
+ClientHandler::ExecutionResult ClientHandler::execute_ordered(const Command& command) {
+    if (command.type == CommandType::SAVE ||
+        (CommandParser::is_mutating(command.type) && persistence_.enabled())) {
+        std::lock_guard lock(write_path_mutex_);
+        return persist_if_needed(execute(command));
+    }
+    return persist_if_needed(execute(command));
 }
 
 bool ClientHandler::send_all(int fd, const std::string& data) const {
@@ -269,12 +308,26 @@ bool ClientHandler::send_all(int fd, const std::string& data) const {
 }
 
 ClientHandler::ExecutionResult ClientHandler::persist_if_needed(ExecutionResult result) {
-    if (!result.should_log || !persistence_.enabled()) {
+    if (!result.should_log) {
+        return result;
+    }
+    if (!persistence_.enabled()) {
+        storage_.take_evicted_keys();
         return result;
     }
 
     std::string error;
-    if (!persistence_.append(result.log_command, error)) {
+    bool persisted = true;
+    if (result.should_log && !persistence_.append(result.log_command, error)) {
+        persisted = false;
+    }
+    for (const auto& key : storage_.take_evicted_keys()) {
+        Command eviction{CommandType::DEL, {key}, {}};
+        if (!persistence_.append(eviction, error)) {
+            persisted = false;
+        }
+    }
+    if (!persisted) {
         result.response = response::error("persistence failure: " + error);
     }
     return result;

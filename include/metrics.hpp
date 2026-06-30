@@ -24,7 +24,11 @@ public:
     std::string info(size_t total_keys,
                      size_t memory_estimate_bytes,
                      size_t worker_threads,
-                     bool aof_enabled) const;
+                     bool aof_enabled,
+                     size_t expired_keys_removed,
+                     size_t evicted_keys,
+                     size_t storage_shards,
+                     const std::string& fsync_policy) const;
 
 private:
     std::chrono::steady_clock::time_point started_at_;

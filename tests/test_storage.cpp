@@ -54,7 +54,7 @@ int main() {
     });
 
     failures += test::run("LRU max keys evicts least recently used", [] {
-        StorageEngine storage(2);
+        StorageEngine storage(2, 8);
         storage.set("a", "1");
         storage.set("b", "2");
         ASSERT_TRUE(storage.get("a").has_value());
@@ -62,6 +62,20 @@ int main() {
         ASSERT_TRUE(storage.exists("a"));
         ASSERT_FALSE(storage.exists("b"));
         ASSERT_TRUE(storage.exists("c"));
+        ASSERT_EQ(static_cast<size_t>(1), storage.evicted_keys());
+        ASSERT_EQ(static_cast<size_t>(8), storage.shard_count());
+    });
+
+    failures += test::run("snapshot captures values and expirations across shards", [] {
+        StorageEngine storage(0, 16);
+        storage.set("first", "one");
+        storage.set("second", "two");
+        storage.expire_at("second", StorageEngine::Clock::now() + std::chrono::seconds(10));
+        const auto entries = storage.snapshot_entries();
+        ASSERT_EQ(static_cast<size_t>(2), entries.size());
+        ASSERT_EQ(std::string("first"), entries[0].key);
+        ASSERT_FALSE(entries[0].expires_at.has_value());
+        ASSERT_TRUE(entries[1].expires_at.has_value());
     });
 
     return failures == 0 ? 0 : 1;

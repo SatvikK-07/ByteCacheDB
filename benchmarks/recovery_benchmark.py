@@ -24,7 +24,14 @@ def wait_for_server(host: str, port: int, timeout: float = 10.0) -> None:
     raise TimeoutError("server did not become ready")
 
 
-def start_server(binary: str, host: str, port: int, threads: int, aof_path: str) -> subprocess.Popen:
+def start_server(
+    binary: str,
+    host: str,
+    port: int,
+    threads: int,
+    aof_path: str,
+    snapshot_path: str,
+) -> subprocess.Popen:
     process = subprocess.Popen(
         [
             binary,
@@ -38,6 +45,10 @@ def start_server(binary: str, host: str, port: int, threads: int, aof_path: str)
             "true",
             "--aof-path",
             aof_path,
+            "--snapshot-path",
+            snapshot_path,
+            "--fsync",
+            "everysec",
         ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -70,8 +81,13 @@ def main() -> int:
     aof_path.parent.mkdir(parents=True, exist_ok=True)
     if aof_path.exists():
         aof_path.unlink()
+    snapshot_path = Path(str(aof_path) + ".snapshot")
+    if snapshot_path.exists():
+        snapshot_path.unlink()
 
-    process = start_server(args.binary, args.host, args.port, args.threads, str(aof_path))
+    process = start_server(
+        args.binary, args.host, args.port, args.threads, str(aof_path), str(snapshot_path)
+    )
     try:
         bench_args = benchmark.parse_args(
             [
@@ -93,7 +109,9 @@ def main() -> int:
         stop_server(process)
 
     started = time.perf_counter()
-    process = start_server(args.binary, args.host, args.port, args.threads, str(aof_path))
+    process = start_server(
+        args.binary, args.host, args.port, args.threads, str(aof_path), str(snapshot_path)
+    )
     recovery_seconds = time.perf_counter() - started
 
     recovered = 0

@@ -1,0 +1,6 @@
+.git
+.github
+build
+data
+benchmarks/__pycache__
+*.zip

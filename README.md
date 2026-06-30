@@ -1,130 +1,151 @@
 # ByteCacheDB
 
-ByteCacheDB is an in-memory key-value database written in C++17. It exposes a simple text protocol over TCP, supports concurrent clients through a worker thread pool, implements TTL expiration, and can recover state from an append-only file.
-
-The project is designed as a resume-grade systems programming project: networking, synchronization, database command execution, persistence, reliability tests, and benchmark tooling live in separate modules instead of one script.
+ByteCacheDB is a C++17 in-memory key-value database built around real TCP sockets, a
+bounded command worker pool, sharded storage, TTL expiration, approximate LRU eviction,
+sequence-ordered append-only persistence, and checkpoint snapshots.
 
 ## Architecture
 
-```text
-TCP clients
-    |
-    v
-+------------------+        +-------------------+
-| Server acceptor  | -----> | ThreadPool queue  |
-+------------------+        +-------------------+
-                                  |
-                                  v
-                         +------------------+
-                         | ClientHandler    |
-                         | line parser      |
-                         | command execute  |
-                         +------------------+
-                                  |
-                 +----------------+----------------+
-                 v                                 v
-        +----------------+                +------------------+
-        | StorageEngine  | <------------> | TTL cleanup      |
-        | unordered_map  |                | background loop  |
-        | shared_mutex   |                +------------------+
-        +----------------+
-                 |
-                 v
-        +----------------+
-        | Append-only    |
-        | persistence    |
-        +----------------+
+```mermaid
+flowchart LR
+    C[Client] --> T[TCP Server]
+    T --> R[Connection Reader]
+    R --> W[Thread Pool]
+    W --> P[Command Parser and Executor]
+    P --> S[Sharded Storage Engine]
+    P --> G[Ordered Write Gate]
+    G --> A[AOF Logger]
+    A --> D[Disk Replay]
+    X[TTL Manager] --> S
+    P --> M[INFO Metrics]
 ```
+
+Each connected socket has a lightweight blocking reader thread. Complete commands are
+submitted to a fixed-size worker pool, so idle clients do not occupy command workers.
+Responses remain ordered per connection. Storage is split into 64 hash shards by default,
+each with its own `std::shared_mutex`.
+
+When AOF is enabled, every mutating command holds one write-path mutex across the storage
+mutation and AOF append. The sequence number and log order therefore match the global
+mutation order.
 
 ## Features
 
-- TCP server with configurable host, port, worker thread count, AOF path, and max-key limit.
-- Multiple concurrent clients using a fixed-size worker thread pool.
-- Request pipelining: clients can send multiple newline-delimited commands without waiting between responses.
-- Thread-safe in-memory storage using `std::unordered_map` and `std::shared_mutex`.
-- TTL support with lazy expiration and a background cleanup thread.
-- Append-only file persistence with startup replay.
-- INFO metrics for uptime, connected clients, command count, key count, expired keys, memory estimate, workers, and AOF status.
-- Unit and concurrency tests through CTest.
-- Python benchmark clients for throughput, latency, pipelining, client sweeps, and AOF recovery.
+- Real IPv4 TCP server with newline-delimited requests and Redis-style responses.
+- 18 user commands including `MGET`, `MSET`, `INCR`, `DECR`, and `SAVE`.
+- Request pipelining with in-order responses.
+- Configurable sharded locking with per-shard maps and locks.
+- Lazy and background TTL expiration using absolute persisted timestamps.
+- Approximate LRU eviction with `--max-keys` and an eviction counter.
+- Sequence-numbered AOF records with `always`, `everysec`, and `never` fsync policies.
+- Atomic snapshot publication and sequence-aware snapshot plus AOF recovery.
+- Quoted values with spaces and escaped quotes, slashes, tabs, and newlines.
+- Graceful `SIGINT`/`SIGTERM` shutdown of the listener, clients, TTL manager, workers,
+  snapshots, and AOF.
+- Unit, concurrency, persistence, and real TCP integration tests.
+- GitHub Actions CI, Docker packaging, demo script, and reproducible benchmarks.
 
-## Supported Commands
+## Commands
 
-| Command | Response | Description |
+| Command | Result | Purpose |
 | --- | --- | --- |
 | `PING` | `+PONG` | Health check |
-| `SET key value` | `+OK` | Set a string value |
+| `SET key value` | `+OK` | Set a value and clear its TTL |
 | `GET key` | bulk string or `$-1` | Read a value |
 | `DEL key` | integer | Delete a key |
-| `EXISTS key` | integer | Return 1 if a key exists |
-| `EXPIRE key seconds` | integer | Set TTL in seconds |
-| `TTL key` | integer | Remaining TTL, `-1` no TTL, `-2` missing |
-| `PERSIST key` | integer | Remove a key's TTL |
-| `KEYS` | array | List keys |
-| `FLUSH` | `+OK` | Clear the store |
-| `INFO` | bulk string | Server metrics |
-| `MSET key value ...` | `+OK` | Set multiple pairs |
+| `EXISTS key` | integer | Test key existence |
+| `EXPIRE key seconds` | integer | Set a relative TTL |
+| `TTL key` | integer | Return remaining TTL |
+| `PERSIST key` | integer | Remove a TTL |
+| `KEYS` | array | List live keys |
+| `FLUSH` | `+OK` | Remove all keys |
+| `INFO` | bulk string | Return server metrics |
+| `MSET key value ...` | `+OK` | Set multiple pairs atomically |
 | `MGET key ...` | array | Read multiple keys |
-| `INCR key` | integer | Increment integer value |
-| `DECR key` | integer | Decrement integer value |
-| `APPEND key value` | integer | Append to string and return length |
+| `INCR key` / `DECR key` | integer | Atomically change an integer |
+| `APPEND key value` | integer | Append and return length |
 | `STRLEN key` | integer | Return string length |
+| `SAVE` | `+OK` | Write an atomic checkpoint snapshot |
 
-## Build
+Values containing whitespace use quotes:
 
-```bash
-mkdir -p build
-cd build
-cmake ..
-cmake --build . --parallel
+```text
+SET greeting "hello systems world"
+GET greeting
 ```
 
-Or use:
+## Build And Run
 
 ```bash
 scripts/build.sh
+./build/bytecachedb \
+  --host 127.0.0.1 \
+  --port 6379 \
+  --threads 8 \
+  --shards 64 \
+  --enable-aof true \
+  --aof-path data/bytecachedb.aof \
+  --snapshot-path data/bytecachedb.snapshot \
+  --fsync everysec \
+  --max-keys 1000000
 ```
 
-## Run
+`--max-keys 0` disables the key limit. `--fsync` accepts `always`, `everysec`, or
+`never`. `scripts/run_server.sh` exposes the same settings through `BYTECACHEDB_*`
+environment variables.
+
+Try a complete build, command sequence, and 10,000-request benchmark:
 
 ```bash
-./build/bytecachedb --host 127.0.0.1 --port 6379 --threads 8 --enable-aof true
+scripts/demo.sh
 ```
 
-Useful options:
+## Persistence
 
-```text
---host 127.0.0.1
---port 6379
---threads 8
---enable-aof true
---aof-path data/bytecachedb.aof
---max-keys 0
---max-line-bytes 1048576
-```
+AOF records have a monotonic sequence prefix. With AOF enabled, successful mutations and
+their records share a global ordering boundary. `EXPIRE` is logged as an absolute
+`EXPIREAT` timestamp so a restart never extends a TTL.
 
-## Example With netcat
+Fsync policies:
 
-```bash
-nc 127.0.0.1 6379
-PING
-SET name Satvik
-GET name
-EXPIRE name 10
-TTL name
-INFO
-```
+| Policy | Behavior |
+| --- | --- |
+| `always` | `fsync` before acknowledging every logged mutation |
+| `everysec` | background `fsync` approximately once per second and during shutdown |
+| `never` | rely on operating-system writeback |
 
-Example responses:
+`SAVE` writes the live keyspace to a temporary snapshot, calls `fsync`, and atomically
+renames it. The snapshot records its AOF sequence; recovery loads the snapshot and only
+replays newer AOF records. LRU victims are logged as explicit `DEL` records so read-driven
+eviction decisions reproduce exactly even though reads themselves are not logged.
 
-```text
-+PONG
-+OK
-$6
-Satvik
-:1
-:10
-```
+## Correctness Guarantees
+
+- Per-key operations are synchronized by the owning shard and are safe under concurrent
+  access.
+- `MSET` locks all affected shards in stable shard order, preventing partial visibility.
+- Concurrent `INCR`/`DECR` operations on one key are atomic.
+- With AOF enabled, logged writes replay in the same global order in which mutations ran.
+- Responses on one TCP connection preserve request order, including pipelined requests.
+- Expired keys are never returned after their absolute expiration time; lazy access and
+  the background sweeper both remove them.
+- Snapshot checkpoints and subsequent AOF records are separated by sequence number.
+
+The database does not provide transactions, rollback after a disk-write failure,
+replication, or cross-process consensus. Durability is strict only with `--fsync always`;
+`everysec` can lose roughly the latest second after a power failure, and `never` can lose
+more.
+
+## INFO Metrics
+
+`INFO` includes:
+
+- uptime and QPS since startup
+- connected clients and total commands
+- total keys and approximate memory bytes
+- expired and evicted key counters
+- AOF status and fsync policy
+- command worker count and storage shard count
 
 ## Tests
 
@@ -132,76 +153,77 @@ Satvik
 scripts/run_tests.sh
 ```
 
-The test suite covers command parsing, storage behavior, TTL expiration, AOF replay, and concurrent readers/writers.
+CTest runs six binaries covering parsing and quoted values, storage and eviction,
+expiration, snapshots and AOF replay, multithreaded access, and black-box TCP behavior.
+The TCP suite binds an ephemeral port and verifies `SET`, `GET`, `DEL`, `EXPIRE`,
+pipelining, invalid commands, quoted values, graceful shutdown, and concurrent AOF replay
+equivalence.
 
-## Benchmarks
+GitHub Actions runs the Release build and the entire suite on every push and pull request.
 
-Start the server first:
+## Benchmark Results
+
+All rows below use real TCP loopback connections, an 8-worker/64-shard Release server,
+AOF disabled, 100,000 commands per row, and a mixed workload of 70% `GET`, 20% `SET`,
+5% `DEL`, and 5% `EXPIRE`.
+
+| Clients | Mode | QPS | Average ms | p50 ms | p95 ms | p99 ms |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| 1 | request-response | 41,602 | 0.023 | 0.023 | 0.026 | 0.029 |
+| 1 | pipeline 32 | 118,647 | 0.008 | 0.008 | 0.009 | 0.009 |
+| 10 | request-response | 45,910 | 0.215 | 0.194 | 0.431 | 0.581 |
+| 10 | pipeline 32 | 229,156 | 0.041 | 0.037 | 0.075 | 0.133 |
+| 100 | request-response | 47,700 | 2.028 | 1.739 | 4.515 | 6.050 |
+| 100 | pipeline 32 | 291,564 | 0.205 | 0.169 | 0.460 | 0.690 |
+
+Recovery benchmark: 100,000 AOF records replayed in 0.108 seconds; 1,000 of 1,000
+sampled keys matched.
+
+### Methodology
+
+- Machine: MacBook Air, Apple M3 (4 performance + 4 efficiency cores), 16 GB RAM.
+- OS and compiler: macOS 26.2 arm64, AppleClang 17.0.0.
+- Build flags: CMake `Release`, `-O3 -DNDEBUG -Wall -Wextra -Wpedantic`.
+- Server: 8 command workers, 64 storage shards, AOF disabled.
+- Client: Python 3 socket clients on `127.0.0.1`; 100,000 successful commands per case.
+- Non-pipelined latency: one wall-clock request/response round trip per sample.
+- Pipelined latency: batch round-trip divided by the number of commands in that batch.
+- Percentiles: samples are sorted and indexed at `round(p * (N - 1))`.
+- Pipelined latency is an amortized per-command measurement and should not be compared
+  directly with independent request latency from a different harness.
+
+Reproduce the matrix:
 
 ```bash
-./build/bytecachedb --port 6379 --threads 8 --enable-aof false
+scripts/run_server.sh
+scripts/run_benchmarks.sh
 ```
 
-Then run:
+Raw data is committed in
+[`benchmarks/matrix_results.json`](benchmarks/matrix_results.json).
+
+## Docker
 
 ```bash
-python3 benchmarks/benchmark.py --clients 100 --requests 100000 --command set
-python3 benchmarks/benchmark.py --clients 100 --requests 100000 --command get
-python3 benchmarks/benchmark.py --clients 500 --requests 200000 --mixed
-python3 benchmarks/benchmark.py --clients 100 --requests 100000 --command mixed --pipelined
+docker build -t bytecachedb .
+docker run --rm -p 6379:6379 -v bytecachedb-data:/data bytecachedb
 ```
-
-Results are printed and written to `benchmarks/results.json`.
-
-| Scenario | Clients | Requests | QPS | p50 ms | p95 ms | p99 ms |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Mixed, pipelined depth 32, AOF off | 100 | 100,000 | 609,592 | 0.011 | 0.029 | 2.899 |
-
-Recovery benchmark:
-
-| Persisted keys | Recovery time | Sample verification |
-| ---: | ---: | ---: |
-| 100,000 | 0.107 seconds | 1,000 / 1,000 keys |
-
-These measurements were collected on June 30, 2026 from a local macOS arm64 environment using an AppleClang 17 Release build. The pipelined benchmark reports per-command latency as batch round-trip time divided by pipeline depth, so compare it with runs from the same harness rather than unrelated systems.
-
-## Design Decisions
-
-- **Thread pool over one thread per connection:** the acceptor stays small and bounded, while worker count is controlled by `--threads`.
-- **Line protocol first:** newline-delimited commands are easy to inspect with `nc`, easy to benchmark, and sufficient for a Redis-like learning project.
-- **Shared storage abstraction:** command execution does not directly touch the map outside `StorageEngine`.
-- **TTL correctness:** expired keys are removed lazily on access and by a background cleanup loop.
-- **AOF over snapshots:** append-only replay is simpler, testable, and good enough for crash recovery. Snapshotting is listed as future work.
-- **Honest metrics:** INFO reports runtime counters and approximate memory use without claiming distributed behavior.
-
-## Persistence Model
-
-When AOF is enabled, successful mutating commands are appended to `data/bytecachedb.aof` by default. On startup, ByteCacheDB replays that file before accepting clients.
-
-`EXPIRE` is persisted internally as `EXPIREAT key epoch_millis`, so restart does not reset TTL back to the original relative duration.
-
-The AOF is flushed after each write for simple durability. This favors correctness and clarity over maximum throughput.
 
 ## Limitations
 
-- Values are whitespace-delimited tokens, not arbitrary binary strings.
-- The networking model uses blocking sockets and a thread pool, not `epoll`, `kqueue`, or `io_uring`.
-- AOF compaction is not implemented, so long-running write-heavy workloads can grow the log.
-- Snapshot persistence is future work.
-- LRU eviction is approximate and based on last access timestamps.
-
-## Future Work
-
-- RESP-compatible parser with quoted or binary-safe values.
-- AOF compaction and snapshot files.
-- Event-driven networking with `epoll` on Linux and `kqueue` on macOS.
-- More granular storage sharding to reduce lock contention.
-- Dockerfile and CI workflow.
+- ByteCacheDB is a single-node database; it is not distributed and has no replication.
+- The protocol resembles Redis responses but is not Redis-compatible or binary-safe.
+- Socket readers use one blocking thread per connection; command execution is bounded by
+  the worker pool, but an event loop would scale better for very large idle populations.
+- There is no authentication, authorization, TLS, transaction support, or scripting.
+- AOF compaction is not implemented, so write-heavy logs grow until manually rotated.
+- Approximate LRU uses timestamps and a global eviction scan, not Redis's sampling model.
 
 ## Resume Bullets
 
-ByteCacheDB | C++, TCP Networking, Concurrency, Database Internals
-
-- Built an in-memory key-value database supporting 17 commands, concurrent TCP clients, TTL eviction, pipelined requests, approximate LRU eviction, and append-only persistence.
-- Measured 610K QPS across 100 concurrent clients with p95 latency of 0.029 ms in a 100,000-request mixed pipelined local benchmark using an 8-thread worker pool.
-- Replayed an append-only log containing 100,000 persisted keys in 0.107 seconds and verified 1,000/1,000 sampled keys after restart.
+- Built a C++17 in-memory database with real TCP pipelining, 64-way sharded locking,
+  atomic counters, TTL, approximate LRU, snapshots, and 18 commands.
+- Designed sequence-ordered AOF persistence with configurable fsync policies and verified
+  concurrent mutation/replay equivalence through black-box socket tests.
+- Measured 292K QPS at 100 clients with pipeline depth 32 and 48K QPS in normal
+  request-response mode on a 100,000-command mixed workload.

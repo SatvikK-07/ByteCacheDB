@@ -1,133 +1,61 @@
-# ByteCacheDB Protocol
+# Protocol
 
-ByteCacheDB uses a simple human-readable, newline-delimited text protocol. Each command is one line ending in `\n` or `\r\n`.
+ByteCacheDB accepts one text command per `\n` or `\r\n` terminated line. Responses use
+Redis-style type prefixes but the protocol is not RESP-compatible.
+
+| Prefix | Meaning |
+| --- | --- |
+| `+` | simple string |
+| `-ERR` | error |
+| `:` | integer |
+| `$N` | bulk string with byte length |
+| `$-1` | missing value |
+| `*N` | array |
+
+Arguments normally end at whitespace. Double quotes preserve spaces and empty values:
 
 ```text
-SET name Satvik
-GET name
+SET greeting "hello systems world"
+SET empty ""
 ```
 
-Responses use Redis-style prefixes for familiarity:
-
-| Prefix | Meaning | Example |
-| --- | --- | --- |
-| `+` | Simple string | `+OK` |
-| `-ERR` | Error | `-ERR invalid command` |
-| `:` | Integer | `:1` |
-| `$N` | Bulk string with length | `$6\r\nSatvik` |
-| `$-1` | Missing bulk string | `$-1` |
-| `*N` | Array | `*2 ...` |
+Inside quotes, `\"`, `\\`, `\n`, `\r`, and `\t` are decoded. The protocol is text-only
+and does not support arbitrary binary bytes.
 
 ## Commands
 
-### PING
-
 ```text
 PING
-```
-
-Returns `+PONG`.
-
-### SET
-
-```text
 SET key value
-```
-
-Stores `value` at `key` and clears any existing TTL.
-
-### GET
-
-```text
 GET key
-```
-
-Returns a bulk string or `$-1` if the key is missing or expired.
-
-### DEL
-
-```text
 DEL key
-```
-
-Returns `:1` when a key was removed and `:0` otherwise.
-
-### EXISTS
-
-```text
 EXISTS key
-```
-
-Returns `:1` when a live key exists and `:0` otherwise.
-
-### EXPIRE
-
-```text
 EXPIRE key seconds
-```
-
-Sets a TTL in seconds. Negative values are rejected. Returns `:1` if the key was updated and `:0` if the key does not exist.
-
-### TTL
-
-```text
 TTL key
-```
-
-Returns:
-
-- `>= 0`: remaining TTL in seconds
-- `-1`: key exists without expiration
-- `-2`: key does not exist
-
-### PERSIST
-
-```text
 PERSIST key
-```
-
-Removes a TTL and returns `:1` if one was removed.
-
-### KEYS
-
-```text
 KEYS
-```
-
-Returns an array of all live keys sorted lexicographically.
-
-### FLUSH
-
-```text
 FLUSH
-```
-
-Clears all keys and returns `+OK`.
-
-### INFO
-
-```text
 INFO
-```
-
-Returns a bulk string containing one metric per line.
-
-### Extended Commands
-
-```text
-MSET key1 value1 key2 value2
-MGET key1 key2
-INCR counter
-DECR counter
+MSET key value [key value ...]
+MGET key [key ...]
+INCR key
+DECR key
 APPEND key suffix
 STRLEN key
+SAVE
 ```
 
-Values are whitespace-delimited. Arbitrary binary strings and quoted strings are not supported in this protocol version.
+`TTL` returns `-1` for a live key without expiry and `-2` for a missing/expired key.
+Integer commands reject non-integer values and overflow. `SAVE` atomically publishes the
+configured checkpoint snapshot.
+
+`EXPIREAT key epoch_millis` is accepted for AOF/snapshot recovery but is an internal
+command rather than part of the public client surface.
 
 ## Pipelining
 
-Clients may send multiple commands without waiting for each response:
+Clients may send multiple complete lines before reading. ByteCacheDB executes and returns
+them in connection order:
 
 ```text
 SET a 1
@@ -135,5 +63,3 @@ GET a
 DEL a
 GET a
 ```
-
-Responses are sent in the same order.

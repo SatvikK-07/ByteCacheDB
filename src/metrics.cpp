@@ -49,16 +49,28 @@ uint64_t Metrics::uptime_seconds() const {
 std::string Metrics::info(size_t total_keys,
                           size_t memory_estimate_bytes,
                           size_t worker_threads,
-                          bool aof_enabled) const {
+                          bool aof_enabled,
+                          size_t expired_keys_removed,
+                          size_t evicted_keys,
+                          size_t storage_shards,
+                          const std::string& fsync_policy) const {
+    const auto uptime = uptime_seconds();
+    const double qps = uptime == 0
+                           ? static_cast<double>(total_commands())
+                           : static_cast<double>(total_commands()) / static_cast<double>(uptime);
     std::ostringstream out;
-    out << "server_uptime_seconds: " << uptime_seconds() << "\n";
+    out << "server_uptime_seconds: " << uptime << "\n";
     out << "connected_clients: " << connected_clients() << "\n";
     out << "total_commands: " << total_commands() << "\n";
+    out << "qps_since_startup: " << qps << "\n";
     out << "total_keys: " << total_keys << "\n";
-    out << "expired_keys_removed: " << expired_keys_removed() << "\n";
+    out << "expired_keys_removed: " << expired_keys_removed << "\n";
+    out << "evicted_keys: " << evicted_keys << "\n";
     out << "memory_estimate_bytes: " << memory_estimate_bytes << "\n";
     out << "worker_threads: " << worker_threads << "\n";
+    out << "storage_shards: " << storage_shards << "\n";
     out << "aof_enabled: " << (aof_enabled ? "true" : "false") << "\n";
+    out << "fsync_policy: " << fsync_policy << "\n";
     return out.str();
 }
 

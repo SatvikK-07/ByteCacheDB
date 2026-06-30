@@ -27,6 +27,7 @@ int main() {
         std::this_thread::sleep_for(std::chrono::milliseconds(80));
         ASSERT_FALSE(storage.get("temp").has_value());
         ASSERT_EQ(-2LL, storage.ttl("temp"));
+        ASSERT_EQ(static_cast<size_t>(1), storage.expired_keys_removed());
     });
 
     failures += test::run("PERSIST removes expiration", [] {
@@ -45,6 +46,7 @@ int main() {
         std::this_thread::sleep_for(std::chrono::milliseconds(40));
         ASSERT_EQ(static_cast<size_t>(1), storage.cleanup_expired());
         ASSERT_EQ(static_cast<size_t>(1), storage.size());
+        ASSERT_EQ(static_cast<size_t>(1), storage.expired_keys_removed());
     });
 
     return failures == 0 ? 0 : 1;

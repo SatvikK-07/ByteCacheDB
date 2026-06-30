@@ -25,6 +25,7 @@ enum class CommandType {
     DECR,
     APPEND,
     STRLEN,
+    SAVE,
     UNKNOWN
 };
 
@@ -50,7 +51,9 @@ public:
 private:
     static CommandType type_from_token(const std::string& token);
     static std::string uppercase(std::string value);
-    static std::vector<std::string> tokenize(std::string_view line);
+    static bool tokenize(std::string_view line,
+                         std::vector<std::string>& tokens,
+                         std::string& error);
     static bool validate_argument_count(CommandType type,
                                         size_t count,
                                         std::string& error);

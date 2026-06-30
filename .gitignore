@@ -1,4 +1,5 @@
 .DS_Store
 build/
 data/*.aof
+data/*.snapshot
 benchmarks/__pycache__/

@@ -2,13 +2,16 @@
 
 #include <algorithm>
 #include <cctype>
-#include <sstream>
 #include <unordered_map>
 
 namespace bytecachedb {
 
 ParseResult CommandParser::parse(std::string_view line) const {
-    auto tokens = tokenize(line);
+    std::vector<std::string> tokens;
+    std::string token_error;
+    if (!tokenize(line, tokens, token_error)) {
+        return {false, {}, token_error};
+    }
     if (tokens.empty()) {
         return {false, {}, "empty command"};
     }
@@ -69,6 +72,8 @@ std::string CommandParser::command_name(CommandType type) {
             return "APPEND";
         case CommandType::STRLEN:
             return "STRLEN";
+        case CommandType::SAVE:
+            return "SAVE";
         case CommandType::UNKNOWN:
             return "UNKNOWN";
     }
@@ -87,6 +92,7 @@ bool CommandParser::is_mutating(CommandType type) {
         case CommandType::INCR:
         case CommandType::DECR:
         case CommandType::APPEND:
+        case CommandType::SAVE:
             return true;
         default:
             return false;
@@ -104,6 +110,7 @@ CommandType CommandParser::type_from_token(const std::string& token) {
         {"MSET", CommandType::MSET},     {"MGET", CommandType::MGET},
         {"INCR", CommandType::INCR},     {"DECR", CommandType::DECR},
         {"APPEND", CommandType::APPEND}, {"STRLEN", CommandType::STRLEN},
+        {"SAVE", CommandType::SAVE},
     };
 
     const auto it = kTypes.find(uppercase(token));
@@ -117,19 +124,66 @@ std::string CommandParser::uppercase(std::string value) {
     return value;
 }
 
-std::vector<std::string> CommandParser::tokenize(std::string_view line) {
-    std::string normalized(line);
-    if (!normalized.empty() && normalized.back() == '\r') {
-        normalized.pop_back();
+bool CommandParser::tokenize(std::string_view line,
+                             std::vector<std::string>& tokens,
+                             std::string& error) {
+    std::string token;
+    bool in_quotes = false;
+    bool escaping = false;
+    bool token_started = false;
+
+    const size_t length = !line.empty() && line.back() == '\r' ? line.size() - 1 : line.size();
+    for (size_t i = 0; i < length; ++i) {
+        const char c = line[i];
+        if (escaping) {
+            switch (c) {
+                case 'n':
+                    token.push_back('\n');
+                    break;
+                case 'r':
+                    token.push_back('\r');
+                    break;
+                case 't':
+                    token.push_back('\t');
+                    break;
+                default:
+                    token.push_back(c);
+                    break;
+            }
+            escaping = false;
+            token_started = true;
+            continue;
+        }
+        if (c == '\\' && in_quotes) {
+            escaping = true;
+            token_started = true;
+            continue;
+        }
+        if (c == '"') {
+            in_quotes = !in_quotes;
+            token_started = true;
+            continue;
+        }
+        if (!in_quotes && std::isspace(static_cast<unsigned char>(c))) {
+            if (token_started) {
+                tokens.push_back(std::move(token));
+                token.clear();
+                token_started = false;
+            }
+            continue;
+        }
+        token.push_back(c);
+        token_started = true;
     }
 
-    std::istringstream input(normalized);
-    std::vector<std::string> tokens;
-    std::string token;
-    while (input >> token) {
-        tokens.push_back(token);
+    if (escaping || in_quotes) {
+        error = escaping ? "unterminated escape sequence" : "unterminated quoted string";
+        return false;
     }
-    return tokens;
+    if (token_started) {
+        tokens.push_back(std::move(token));
+    }
+    return true;
 }
 
 bool CommandParser::validate_argument_count(CommandType type,
@@ -151,6 +205,7 @@ bool CommandParser::validate_argument_count(CommandType type,
         case CommandType::KEYS:
         case CommandType::FLUSH:
         case CommandType::INFO:
+        case CommandType::SAVE:
             return exact(0);
         case CommandType::GET:
         case CommandType::DEL:

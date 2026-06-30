@@ -13,6 +13,7 @@ endif()
 add_compile_options(-Wall -Wextra -Wpedantic)
 
 include_directories(include)
+find_package(Threads REQUIRED)
 
 set(BYTECACHEDB_CORE_SOURCES
     src/client_handler.cpp
@@ -28,6 +29,7 @@ set(BYTECACHEDB_CORE_SOURCES
 
 add_library(bytecachedb_core ${BYTECACHEDB_CORE_SOURCES})
 target_include_directories(bytecachedb_core PUBLIC include)
+target_link_libraries(bytecachedb_core PUBLIC Threads::Threads)
 
 add_executable(bytecachedb src/main.cpp)
 target_link_libraries(bytecachedb PRIVATE bytecachedb_core)
@@ -46,3 +48,4 @@ add_bytecachedb_test(test_storage tests/test_storage.cpp)
 add_bytecachedb_test(test_ttl tests/test_ttl.cpp)
 add_bytecachedb_test(test_persistence tests/test_persistence.cpp)
 add_bytecachedb_test(test_concurrency tests/test_concurrency.cpp)
+add_bytecachedb_test(test_tcp_integration tests/test_tcp_integration.cpp)
